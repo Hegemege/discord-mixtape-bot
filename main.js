@@ -93,25 +93,7 @@ setInterval(() => {
         (err, docs) => {
             // First check if there are no releases that are old enough
             if (docs.length === 0) {
-                playlistDB.count({}, (err, count) => {
-                    // If there are in fact no mixtapes yet, let's add one
-                    if (err) {
-                        logger.error("Could not get playlistDB count: " + err);
-                        return;
-                    }
-
-                    if (count === 0) {
-                        createNewPlaylist("Hot Mixtape 1", (success, playlistId) => {
-                            if (success) {
-                                logger.info("Created playlist with id", playlistId);
-                            } else {
-                                logger.error("Unable to create new playlist");
-                            }
-                        });
-                        return;
-                    }
-
-                });
+                createInitialPlaylist(() => {});
                 return;
             } 
 
@@ -215,7 +197,7 @@ bot.on("message", message => {
             // Add the link to the current mixtape
             // Get the playlistId of the current mixtape
             playlistDB.find({ "released": false }, (err, docs) => {
-                if (err || docs.length === 0 || docs.length !== 1) {
+                if (err || docs.length > 1) {
                     if (err) logger.error("Error while retrieving non-released playlists: " + err);
 
                     // Better way of saying 500 - Internal Server Error
@@ -226,10 +208,29 @@ bot.on("message", message => {
                     return;
                 }
 
+                if (docs.length === 0) {
+                    createInitialPlaylist((success, playlistId) => {
+                        if (success) {
+                            logger.info("Adding video " + matches[1] + " to playlist " + playlistId);
+                            addToPlaylist(message, matches[1], playlistId);
+                        } else {
+                            logger.error("Can't create initial playlist");
+                            message.react("🤖");
+                            setTimeout(() => {
+                                message.react("🔫");
+                            }, 200);
+                            return;
+                        }
+                    });
+                }
+
                 // There is only one unreleased playlist
                 // Add the given video there. The video ID can be gound in matches[1];
-                logger.info("Adding video " + matches[1] + " to playlist " + docs[0].id);
-                addToPlaylist(message, matches[1], docs[0].id)
+                if (docs.length === 1) {
+                    logger.info("Adding video " + matches[1] + " to playlist " + docs[0].id);
+                    addToPlaylist(message, matches[1], docs[0].id);
+                }
+
             });
 
             break;
@@ -384,6 +385,30 @@ function removeFromPlaylist(message, playlistItemId) {
     });
 }
 
+function createInitialPlaylist(callback) {
+    playlistDB.count({}, (err, count) => {
+        // If there are in fact no mixtapes yet, let's add one
+        if (err) {
+            logger.error("Could not get playlistDB count: " + err);
+            return;
+        }
+
+        if (count === 0) {
+            createNewPlaylist("Hot Mixtape 1", (success, playlistId) => {
+                if (success) {
+                    logger.info("Created playlist with id", playlistId);
+                } else {
+                    logger.error("Unable to create new playlist");
+                }
+
+                callback(success, playlistId);
+            });
+            return;
+        }
+
+        // No need to do anything
+    });
+}
 
 /* Code from Google dev API on authenticating to youtube */
 
