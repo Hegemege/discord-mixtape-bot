@@ -34,11 +34,12 @@ playlistDB = new Datastore({
 
 // Data model to save in the videosDB
 class VideoEntry {
-    constructor(id, playlistId) {
-        this.id = id; // Youtube video id
+    constructor(videoId, playlistId, playlistItemId) {
+        this.id = videoId; // Youtube video id
         // The url can be constructed easily from the id
         //this.url = "https://youtube.com/watch?v=" + this.id
         this.playlistId = playlistId;
+        this.playlistItemId = playlistItemId; // Used to uniquely identify this entry on the playlist
         this.archived = false; // Whether the mixtape the video belongs to has been published
     }
 }
@@ -54,25 +55,39 @@ class Playlist {
     }
 }
 
+let cleanupInterval = (+config.cleanupInterval) * 60 * 60 * 1000; // cleanupInterval given in hours.
+let checkInterval = (+config.mixtapeCheckInterval) * 60 * 1000 // mixtapeInterval given in minutes
+let releaseInterval = (+config.mixtapeReleaseInterval) * 60 * 60 * 1000;
+let oldVideosThreshold = (+config.deleteOldVideosThreshold) * 60 * 60 * 1000; // Given in hours. Note: be aware of int32 limitations
+let requiredVideosBeforeRelease = (+config.requiredVideosForMixtape);
+
+if (config.devMode) {
+    cleanupInterval = 5 * 1000;
+    checkInterval = 5 * 1000;
+    releaseInterval = 60 * 1000;
+    oldVideosThreshold = 5 * 60 * 1000;
+    requiredVideosBeforeRelease = 3;
+}
+
 // Regularly clean up old, archived entries 
 setInterval(() => {
-    let monthAgo = Date.now() - config.deleteOldVideosThreshold * 60 * 60 * 1000; // Given in hours. Note: be aware of int32 limitations
+    let monthAgo = Date.now() - oldVideosThreshold; 
     videosDB.remove( {
         "createdAt": { 
-            $lt: twoMonthsAgo 
+            $lt: new Date(monthAgo) 
         }, "archived": true
     }, { multi: true }, (err, docs) => {
         if (docs.length > 0) {
             logger.info("Deleted " + docs.length + " old entries.");
         }
     });
-}, (+config.cleanupInterval) * 60 * 60 * 1000); // cleanupInterval given in hours.
+}, cleanupInterval); 
 
 // Set up the mixtape publish / update interval
 setInterval(() => {
     // Check if it has been longer than the given release interval for a mixtape 
     // (there should only be one in the DB with released = false)
-    let lastRelease = Date.now() - config.mixtapeReleaseInterval * 60 * 60 * 1000; // Given in hours.
+    let lastRelease = Date.now() - releaseInterval; // Given in hours.
     playlistDB.find(
         { "updatedAt": { $lt: new Date(lastRelease) }, "released": false },
         (err, docs) => {
@@ -109,11 +124,12 @@ setInterval(() => {
                 // Send a message to the channel with the mixtape's URL and set it as released
                 // Also create a new mixtape playlist ready for submissions
 
-                // If there were no videos posted, do not send the message but only refresh the playlist in DB
+                // If there are not enough videos posted, do not send the message but only refresh the playlist in DB
                 videosDB.find({ "playlistId": doc.id }, (err, docs) => {
                     if (err) return;
 
-                    if (docs.length !== 0) {
+                    // Only release if there are a minimum number of videos on the playlist
+                    if (docs.length >= requiredVideosBeforeRelease) {
                         // Form the url using the first video and the list id
                         let firstVideo = docs[0];
                         let mixtapeUrl = "https://youtube.com/watch?v=" + firstVideo.id + "&list=" + doc.id; // Not to be confused with _id given by NeDB.
@@ -148,9 +164,6 @@ setInterval(() => {
         
                             }
                         );
-                    } else {
-                        // Just update the doc in playlistDB, this resets the updatedAt timestamp
-                        playlistDB.update({ "id": doc.id }, { $set: { "released": false } }, { returnUpdatedDocs: true}, (err, numAffected, affectedDocuments) => {});
                     }
                 });
 
@@ -158,7 +171,7 @@ setInterval(() => {
             }
         }
     );
-}, (+config.mixtapeCheckInterval) * 60 * 1000); // mixtapeInterval given in minutes
+}, checkInterval); 
 
 // Login to discord with the token
 logger.info("Connecting...");
@@ -222,12 +235,39 @@ bot.on("message", message => {
             break;
         case "remove":
         case "delete":
-            // Delete the link from the current mixtape
-            logger.error("Deleting links not implemented yet");
-            message.react("🤖");
-            setTimeout(() => {
-                message.react("❓");
-            }, 200);
+            // Get the first video with the given id
+            let videoId = matches[1];
+
+            videosDB.find({ "id": videoId }, (err, docs) => {
+                if (err || !docs || docs.length === 0) {
+                    message.react("🚫");
+                    return;
+                }
+
+                // Delete the first one only
+                let doc = docs[0];
+                let playlistItemId = doc.playlistItemId;
+
+                // Delete from DB and youtube
+                videosDB.remove({ "id": videoId }, (err, numRemoved) => {
+                    if (err) {
+                        logger.error("Unable to delete video from DB: " + err);
+                        message.react("🤖");
+                        setTimeout(() => {
+                            message.react("🚫");
+                        }, 200);
+                        return;
+                    }
+
+                    logger.info("Deleted video with id " + doc.id);
+                    removeFromPlaylist(message, playlistItemId);
+                });
+
+                
+            });
+            break;
+        default:
+            message.react("❓");
             break;
     }
     
@@ -296,8 +336,9 @@ function addToPlaylist(message, videoId, playlistId) {
                 // If successful, add reaction to the message
                 if (success) {
                     message.react("✅");
+
                     // Also save the video in the DB
-                    let video = new VideoEntry(videoId, playlistId);
+                    let video = new VideoEntry(videoId, playlistId, response.data.id);
                     videosDB.insert(video);
                 } else {
                     logger.error("Failed to add video to playlist");
@@ -307,6 +348,38 @@ function addToPlaylist(message, videoId, playlistId) {
                     message.react("🚫");
                 }
             })
+        });
+    });
+}
+
+function removeFromPlaylist(message, playlistItemId) {
+    // Load client secrets from a local file.
+    fs.readFile("client_secret.json", function processClientSecrets(err, content) {
+        if (err) {
+            console.log("Error loading client secret file: " + err);
+            return;
+        }
+
+        // Authorize a client with the loaded credentials, then call the YouTube API.
+        authorize(JSON.parse(content), 
+        {
+            "params": {
+                "id": playlistItemId,
+                "onBehalfOfContentOwner": ""
+            }
+        }, (client, data) => {
+            playlistItemsDelete(client, data, (success, response) => {
+                if (success) {
+                    logger.info("Youtube response: Video removed from playlist successfully");
+                    message.react("✅");
+                } else {
+                    logger.error("Failed to remove video from playlist");
+                    logger.error(response.status);
+                    logger.error(response.statusText);
+                    logger.error(response.data);
+                    message.react("🚫");
+                }
+            });
         });
     });
 }
@@ -480,6 +553,21 @@ function playlistItemsInsert(auth, requestData, callback) {
     service.playlistItems.insert(parameters, function(err, response) {
         if (err) {
             console.log("The API returned an error: " + err);
+            callback(false, response);
+            return;
+        }
+        callback(true, response);
+    });
+}
+
+
+function playlistItemsDelete(auth, requestData, callback) {
+    var service = google.youtube('v3');
+    var parameters = removeEmptyParameters(requestData['params']);
+    parameters['auth'] = auth;
+    service.playlistItems.delete(parameters, function(err, response) {
+        if (err) {
+            console.log('The API returned an error: ' + err);
             callback(false, response);
             return;
         }

@@ -1,8 +1,10 @@
 {
+    "devMode": false,
     "activeChannels": ["419249341815980047", "419273180541091872"],
     "mixtapeReleaseChannel": "419249341815980047",
     "mixtapeReleaseInterval": "168",
     "mixtapeCheckInterval": "5",
+    "requiredVideosForMixtape": "5",
     "cleanupInterval": "6",
     "deleteOldVideosThreshold": "720"
 }
