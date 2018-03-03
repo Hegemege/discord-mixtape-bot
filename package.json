@@ -5,7 +5,7 @@
     "main": "bot.js",
     "author": "https://github.com/Hegemege",
     "scripts": {
-        "build": "npm install && rimraf dist &&  webpack --config webpack.config.js --mode=production --progress --profile --colors",
+        "build": "npm install && rimraf dist &&  webpack --config webpack.config.js --mode=development --progress --profile --colors",
         "dev": "node main.js"
     },
     "dependencies": {
