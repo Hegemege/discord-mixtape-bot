@@ -20,21 +20,25 @@ let bot = new Discord.Client();
 videosDB = new Datastore({ 
     filename: path.join(__dirname, "/db/videos.db"), 
     autoload: true, 
-    timestampData: true
+    timestampData: true,
+    autoCompactInterval: 60 * 60 * 1000 // Every hour
 });
 
 // Initialize a db to store all created playlists
 playlistDB = new Datastore({
-    filename: path.join(__dirname, "/db/playlist.db")
+    filename: path.join(__dirname, "/db/playlist.db"),
+    autoload: true,
+    timestampData: true,
+    autoCompactInterval: 60 * 60 * 1000 // Every hour
 });
 
 // Data model to save in the videosDB
 class VideoEntry {
-    constructor(id) {
+    constructor(id, playlistId) {
         this.id = id; // Youtube video id
         // The url can be constructed easily from the id
         //this.url = "https://youtube.com/watch?v=" + this.id
-
+        this.playlistId = playlistId;
         this.archived = false; // Whether the mixtape the video belongs to has been published
     }
 }
@@ -66,19 +70,23 @@ setInterval(() => {
 
 // Set up the mixtape publish / update interval
 setInterval(() => {
-    return;
     // Check if it has been longer than the given release interval for a mixtape 
     // (there should only be one in the DB with released = false)
     let lastRelease = Date.now() - config.mixtapeReleaseInterval * 60 * 60 * 1000; // Given in hours.
     playlistDB.find(
-        { "updatedAt": { $lt: lastRelease }, "released": false },
+        { "updatedAt": { $lt: new Date(lastRelease) }, "released": false },
         (err, docs) => {
             // First check if there are no releases that are old enough
             if (docs.length === 0) {
                 playlistDB.count({}, (err, count) => {
                     // If there are in fact no mixtapes yet, let's add one
+                    if (err) {
+                        logger.error("Could not get playlistDB count: " + err);
+                        return;
+                    }
+
                     if (count === 0) {
-                        createNewPlaylist((success, playlistId) => {
+                        createNewPlaylist("Hot Mixtape 1", (success, playlistId) => {
                             if (success) {
                                 logger.info("Created playlist with id", playlistId);
                             } else {
@@ -100,17 +108,59 @@ setInterval(() => {
                 // We found a mixtape that can be released!
                 // Send a message to the channel with the mixtape's URL and set it as released
                 // Also create a new mixtape playlist ready for submissions
-                let mixtapeUrl = "https://youtube.com/watch?v=" + doc.id; // Not to be confused with _id given by NeDB.
-                let channelMessage = "Hot new mixtape \"" + doc.name + "\" is now available, enjoy! " + mixtapeUrl;
 
-                var channel = bot.channels.get(config.mixtapeReleaseChannel);
-                bot.sendMessage(channel, channelMessage);
+                // If there were no videos posted, do not send the message but only refresh the playlist in DB
+                videosDB.find({ "playlistId": doc.id }, (err, docs) => {
+                    if (err) return;
+
+                    if (docs.length !== 0) {
+                        // Form the url using the first video and the list id
+                        let firstVideo = docs[0];
+                        let mixtapeUrl = "https://youtube.com/watch?v=" + firstVideo.id + "&list=" + doc.id; // Not to be confused with _id given by NeDB.
+                        let channelMessage = "🔥Hot🔥new🔥mixtape🔥 \"" + doc.name + "\" is now available, enjoy! " + mixtapeUrl + ". New additions from now on will be released in the next 🔥mixtape🔥";
+        
+                        var channel = bot.channels.get(config.mixtapeReleaseChannel);
+                        channel.send(channelMessage);
+        
+                        // Set as released
+                        playlistDB.update(
+                            { "id": doc.id },
+                            { $set: { "released": true } },
+                            {},
+                            (err, numAffected) => {
+                                if (err) {
+                                    console.log("Error updating playlist as released:", err);
+                                    return;
+                                }
+                                // Also set the videos as archived
+                                videosDB.update({ "playlistId": doc.id }, { $set: { "archived": true }}, { multi: true }, (err, numaffected) => {});
+        
+                                // And create a new mixtape
+                                playlistDB.count({}, (err, count) => {
+                                    createNewPlaylist("Hot Mixtape " + (count + 1) ,(success, playlistId) => {
+                                        if (success) {
+                                            logger.info("Created playlist with id", playlistId);
+                                        } else {
+                                            logger.error("Unable to create new playlist");
+                                        }
+                                    });
+                                });
+        
+                            }
+                        );
+                    } else {
+                        // Just update the doc in playlistDB, this resets the updatedAt timestamp
+                        playlistDB.update({ "id": doc.id }, { $set: { "released": false } }, { returnUpdatedDocs: true}, (err, numAffected, affectedDocuments) => {});
+                    }
+                });
+
+
             }
         }
     );
 }, (+config.mixtapeCheckInterval) * 60 * 1000); // mixtapeInterval given in minutes
 
-// Login with the token
+// Login to discord with the token
 logger.info("Connecting...");
 bot.login(auth.token)
     .then(() => {
@@ -131,16 +181,53 @@ bot.on("message", message => {
     let command = args[0];
     args = args.splice(1);
 
+    if (args.length !== 1) {
+        message.react("❓");
+        return;
+    }
+
+    args[0] = args[0].replace("<", "").replace(">", "");
+
+    var matches = args[0].match(/http(?:s?):\/\/(?:www\.)?youtu(?:be\.com\/watch\?v=|\.be\/)([\w\-\_]*)(&(amp;)?‌​[\w\?‌​=]*)?/);
+    if (!matches) {
+        message.react("❓");
+        return;
+    }
+
     switch(command) {
         // Add a link
         case "add":
         case "insert":
         case "link":
             // Add the link to the current mixtape
+            // Get the playlistId of the current mixtape
+            playlistDB.find({ "released": false }, (err, docs) => {
+                if (err || docs.length === 0 || docs.length !== 1) {
+                    if (err) logger.error("Error while retrieving non-released playlists: " + err);
+
+                    // Better way of saying 500 - Internal Server Error
+                    message.react("🤖");
+                    setTimeout(() => {
+                        message.react("🔫");
+                    }, 200);
+                    return;
+                }
+
+                // There is only one unreleased playlist
+                // Add the given video there. The video ID can be gound in matches[1];
+                logger.info("Adding video " + matches[1] + " to playlist " + docs[0].id);
+                addToPlaylist(message, matches[1], docs[0].id)
+            });
+
             break;
         case "remove":
         case "delete":
             // Delete the link from the current mixtape
+            logger.error("Deleting links not implemented yet");
+            message.react("🤖");
+            setTimeout(() => {
+                message.react("❓");
+            }, 200);
             break;
     }
     
@@ -148,7 +235,7 @@ bot.on("message", message => {
 
 /* Helper methods to access the Youtube API */
 
-function createNewPlaylist(callback) {
+function createNewPlaylist(name, callback) {
     // Load client secrets from a local file.
     fs.readFile("client_secret.json", function processClientSecrets(err, content) {
         if (err) {
@@ -165,8 +252,8 @@ function createNewPlaylist(callback) {
             }, 
             "properties": {
                 "id": "",
-                "snippet.title": "Test Playlist",
-                "snippet.description": "My Hot Mixtape",
+                "snippet.title": name,
+                "snippet.description": "",
                 "snippet.tags[]": "",
                 "status.privacyStatus": "unlisted"
             }
@@ -174,7 +261,7 @@ function createNewPlaylist(callback) {
             playlistsInsert(client, data, (success, response) => {
                 // If successful, store the new playlist ID into DB
                 let playlistId = response.data.id;
-                let playlist = new Playlist(playlistId);
+                let playlist = new Playlist(playlistId, name);
                 playlistDB.insert(playlist);
 
                 callback(success, playlistId);
@@ -210,7 +297,7 @@ function addToPlaylist(message, videoId, playlistId) {
                 if (success) {
                     message.react("✅");
                     // Also save the video in the DB
-                    let video = new VideoEntry(videoId);
+                    let video = new VideoEntry(videoId, playlistId);
                     videosDB.insert(video);
                 } else {
                     logger.error("Failed to add video to playlist");
